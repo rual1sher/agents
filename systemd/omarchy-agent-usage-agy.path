@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh agy usage whenever the agents panel refreshes
+
+[Path]
+# omarchy-agent-usage-update rewrites claude.json on every panel refresh.
+PathChanged=%h/.local/state/omarchy/agents/usage/claude.json
+
+[Install]
+WantedBy=default.target

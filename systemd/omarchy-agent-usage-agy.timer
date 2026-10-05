@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic agy usage refresh for the Omarchy agents panel
+
+[Timer]
+OnStartupSec=10s
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

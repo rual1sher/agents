@@ -1,0 +1,134 @@
+#!/bin/bash
+
+# Antigravity CLI (agy) collector for the omarchy.agents bar panel. Prints one
+# record in the omarchy-agent-usage-<agent> contract. Local stats only:
+# prompts from history.jsonl, sessions from conversation_summaries.db, models
+# and tokens from the conversation transcripts. Omarchy only runs collectors
+# from $OMARCHY_PATH/bin, so the omarchy-agent-usage-agy.path user unit runs
+# this with --write whenever the stock update rewrites claude.json.
+
+AGY_DIR="${AGY_HOME:-$HOME/.gemini/antigravity-cli}"
+USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+
+# Never ran agy here: no record, so no tab.
+[[ -d $AGY_DIR ]] || exit 0
+
+if [[ $1 == "--write" ]]; then
+  record=$("$0") && [[ -n $record ]] || exit 1
+  mkdir -p "$USAGE_DIR"
+  tmp=$(mktemp "$USAGE_DIR/.agy.XXXXXX")
+  printf '%s\n' "$record" >"$tmp"
+  mv "$tmp" "$USAGE_DIR/agy.json"
+  exit
+fi
+
+prompts='[]'
+if [[ -f $AGY_DIR/history.jsonl ]]; then
+  prompts=$(jq -sc '[.[] | .timestamp? | numbers | ./1000 | floor | localtime | strftime("%Y-%m-%d")]' \
+    "$AGY_DIR/history.jsonl" 2>/dev/null) || prompts='[]'
+fi
+
+sessions=''
+if [[ -f $AGY_DIR/conversation_summaries.db ]]; then
+  sessions=$(sqlite3 -readonly -json "$AGY_DIR/conversation_summaries.db" \
+    "select date(substr(last_user_input_time, 1, 19), 'localtime') as date
+       from conversation_summaries where parent_conversation_id = ''" 2>/dev/null)
+fi
+[[ -n $sessions ]] || sessions='[]'
+
+# One row per transcript step: its day, the model selected at that point, and
+# whatever token counts agy put on the step (Gemini usageMetadata spelling or
+# the generic one). The model is tracked per conversation from the
+# "Model Selection" settings notes agy injects into user turns.
+shopt -s nullglob
+transcripts=("$AGY_DIR"/brain/*/.system_generated/logs/transcript_full.jsonl)
+steps='[]'
+if ((${#transcripts[@]})); then
+  steps=$(jq -nc '
+    def day: (.created_at // "") | sub("\\.[0-9]+"; "")
+      | (try (fromdateiso8601 | localtime | strftime("%Y-%m-%d")) catch null);
+    def sumk($ks): [paths(numbers) as $p | select($p[-1] | IN($ks[])) | getpath($p)] | add // 0;
+    def selected_model: (.content // "")
+      | if type == "string" then ([(try (capture("`Model Selection` from .*? to (?<m>.+?)\\.\\s*(?:No need|If reporting|$)") | .m) catch null)] | first // null) else null end;
+
+    [inputs | {file: input_filename, step: .}]
+    | group_by(.file)
+    | map(reduce .[].step as $s ({model: null, rows: []};
+        ($s | selected_model) as $m
+        | (if $m then .model = $m else . end)
+        | .rows += [{
+            date: ($s | day),
+            model: (.model // "unknown"),
+            input: ($s | sumk(["promptTokenCount", "input_tokens", "inputTokens"])),
+            cached: ($s | sumk(["cachedContentTokenCount", "cache_read_input_tokens", "cacheReadInputTokens", "cache_read_tokens"])),
+            output: ($s | sumk(["candidatesTokenCount", "thoughtsTokenCount", "output_tokens", "outputTokens"]))
+          }]
+      ) | .rows)
+    | add // []
+  ' "${transcripts[@]}" 2>/dev/null) || steps='[]'
+fi
+
+# Rate limits come from agy's own /usage command, which prints one line per
+# window: model group, window, percent remaining, reset time (tab-separated).
+# Gemini and Claude/GPT models have separate 5-hour and weekly allowances.
+limits='[]'
+if command -v agy >/dev/null; then
+  limits=$(timeout 15 agy -p /usage --print-timeout 10s 2>/dev/null | jq -Rnc '
+    [inputs | split("\t") | select(length >= 3)
+      | (.[0] | if test("gemini"; "i") then "Gemini" elif test("claude|gpt"; "i") then "Claude/GPT" else sub(" [Mm]odels$"; "") end) as $group
+      | (.[1] | test("week"; "i")) as $weekly
+      | (.[2] | rtrimstr("%") | try tonumber catch null) as $rem
+      | select($rem != null)
+      | {
+          title: ($group + (if $weekly then " weekly" else " 5h" end)),
+          label: ($group + (if $weekly then " (weekly)" else " (5-hour)" end)),
+          percent: (((100 - $rem) | [., 0] | max) / 100),
+          resetsAt: (.[3] // "")
+        }]
+    | sort_by([(.title | test("^Gemini") | not), (.title | test("weekly"))])') || limits='[]'
+fi
+
+dates=$(for offset in 6 5 4 3 2 1 0; do date -d "-$offset day" +%F; done | jq -Rsc 'split("\n") | map(select(. != ""))')
+
+jq -n \
+  --argjson prompts "$prompts" \
+  --argjson sessions "$sessions" \
+  --argjson steps "$steps" \
+  --argjson dates "$dates" \
+  --argjson limits "$limits" \
+  --arg today "$(date +%F)" '
+  def tokens: map(.input + .output) | add // 0;
+  ([$prompts[], $sessions[].date, ($steps[].date | select(.))] | unique) as $active
+  | {
+      schemaVersion: 1,
+      id: "agy",
+      name: "Antigravity",
+      ready: true,
+      tierLabel: "",
+      usageStatusText: "",
+      authHelpText: "",
+      hasLocalStats: true,
+      hasPromptStats: true,
+      limits: $limits,
+      todayPrompts: ($prompts | map(select(. == $today)) | length),
+      todaySessions: ($sessions | map(select(.date == $today)) | length),
+      todayTotalTokens: ($steps | map(select(.date == $today)) | tokens),
+      todayTokensByModel: ($steps | map(select(.date == $today and .model != "unknown"))
+        | group_by(.model) | map({key: .[0].model, value: tokens}) | from_entries),
+      recentDays: ($dates | map(. as $d | {date: $d, messageCount: ($steps | map(select(.date == $d)) | tokens)})),
+      totalPrompts: ($prompts | length),
+      totalSessions: ($sessions | length),
+      activeDates: $active,
+      activeDays: ($active | length),
+      modelUsage: ($steps | group_by(.model)
+        | map(select(.[0].model != "unknown" or tokens > 0))
+        | map({key: .[0].model, value: {
+            inputTokens: (map([.input - .cached, 0] | max) | add),
+            outputTokens: (map(.output) | add),
+            cacheReadInputTokens: (map(.cached) | add),
+            cacheCreationInputTokens: 0
+          }})
+        | from_entries),
+      updatedAt: (now | todate)
+    }
+'
