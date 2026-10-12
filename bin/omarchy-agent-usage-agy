@@ -1,134 +1,401 @@
-#!/bin/bash
+#!/usr/bin/env python3
+# omarchy:summary=Print the Antigravity (agy) usage record as JSON
+# omarchy:args=[--force] [--limits-only] [--write]
+# omarchy:hidden=true
+"""Collect Antigravity CLI (agy) usage into one display-ready JSON record.
 
-# Antigravity CLI (agy) collector for the omarchy.agents bar panel. Prints one
-# record in the omarchy-agent-usage-<agent> contract. Local stats only:
-# prompts from history.jsonl, sessions from conversation_summaries.db, models
-# and tokens from the conversation transcripts. Omarchy only runs collectors
-# from $OMARCHY_PATH/bin, so the omarchy-agent-usage-agy.path user unit runs
-# this with --write whenever the stock update rewrites claude.json.
+Local stats come from ~/.gemini/antigravity-cli (history.jsonl,
+conversation_summaries.db, and conversation transcripts). Rate limits come
+from `agy -p /usage`. The Omarchy agents panel watches ~/.local/state/omarchy/agents/usage/
+and renders this record.
+"""
 
-AGY_DIR="${AGY_HOME:-$HOME/.gemini/antigravity-cli}"
-USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+from __future__ import annotations
 
-# Never ran agy here: no record, so no tab.
-[[ -d $AGY_DIR ]] || exit 0
+import argparse
+import datetime as dt
+import fcntl
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
 
-if [[ $1 == "--write" ]]; then
-  record=$("$0") && [[ -n $record ]] || exit 1
-  mkdir -p "$USAGE_DIR"
-  tmp=$(mktemp "$USAGE_DIR/.agy.XXXXXX")
-  printf '%s\n' "$record" >"$tmp"
-  mv "$tmp" "$USAGE_DIR/agy.json"
-  exit
-fi
+AGENT_ID = "agy"
+AGENT_NAME = "Antigravity"
+AUTH_HELP = ""
+SCAN_REUSE_SECONDS = 15
+LIMITS_ONLY_REUSE_SECONDS = 900
+LIMITS_CACHE_SECONDS = 30
 
-prompts='[]'
-if [[ -f $AGY_DIR/history.jsonl ]]; then
-  prompts=$(jq -sc '[.[] | .timestamp? | numbers | ./1000 | floor | localtime | strftime("%Y-%m-%d")]' \
-    "$AGY_DIR/history.jsonl" 2>/dev/null) || prompts='[]'
-fi
 
-sessions=''
-if [[ -f $AGY_DIR/conversation_summaries.db ]]; then
-  sessions=$(sqlite3 -readonly -json "$AGY_DIR/conversation_summaries.db" \
-    "select date(substr(last_user_input_time, 1, 19), 'localtime') as date
-       from conversation_summaries where parent_conversation_id = ''" 2>/dev/null)
-fi
-[[ -n $sessions ]] || sessions='[]'
+def get_agy_dir() -> Path:
+  return Path(os.environ.get("AGY_HOME", Path.home() / ".gemini" / "antigravity-cli")).resolve()
 
-# One row per transcript step: its day, the model selected at that point, and
-# whatever token counts agy put on the step (Gemini usageMetadata spelling or
-# the generic one). The model is tracked per conversation from the
-# "Model Selection" settings notes agy injects into user turns.
-shopt -s nullglob
-transcripts=("$AGY_DIR"/brain/*/.system_generated/logs/transcript_full.jsonl)
-steps='[]'
-if ((${#transcripts[@]})); then
-  steps=$(jq -nc '
-    def day: (.created_at // "") | sub("\\.[0-9]+"; "")
-      | (try (fromdateiso8601 | localtime | strftime("%Y-%m-%d")) catch null);
-    def sumk($ks): [paths(numbers) as $p | select($p[-1] | IN($ks[])) | getpath($p)] | add // 0;
-    def selected_model: (.content // "")
-      | if type == "string" then ([(try (capture("`Model Selection` from .*? to (?<m>.+?)\\.\\s*(?:No need|If reporting|$)") | .m) catch null)] | first // null) else null end;
 
-    [inputs | {file: input_filename, step: .}]
-    | group_by(.file)
-    | map(reduce .[].step as $s ({model: null, rows: []};
-        ($s | selected_model) as $m
-        | (if $m then .model = $m else . end)
-        | .rows += [{
-            date: ($s | day),
-            model: (.model // "unknown"),
-            input: ($s | sumk(["promptTokenCount", "input_tokens", "inputTokens"])),
-            cached: ($s | sumk(["cachedContentTokenCount", "cache_read_input_tokens", "cacheReadInputTokens", "cache_read_tokens"])),
-            output: ($s | sumk(["candidatesTokenCount", "thoughtsTokenCount", "output_tokens", "outputTokens"]))
-          }]
-      ) | .rows)
-    | add // []
-  ' "${transcripts[@]}" 2>/dev/null) || steps='[]'
-fi
+def get_usage_dir() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "omarchy" / "agents" / "usage"
 
-# Rate limits come from agy's own /usage command, which prints one line per
-# window: model group, window, percent remaining, reset time (tab-separated).
-# Gemini and Claude/GPT models have separate 5-hour and weekly allowances.
-limits='[]'
-if command -v agy >/dev/null; then
-  limits=$(timeout 15 agy -p /usage --print-timeout 10s 2>/dev/null | jq -Rnc '
-    [inputs | split("\t") | select(length >= 3)
-      | (.[0] | if test("gemini"; "i") then "Gemini" elif test("claude|gpt"; "i") then "Claude/GPT" else sub(" [Mm]odels$"; "") end) as $group
-      | (.[1] | test("week"; "i")) as $weekly
-      | (.[2] | rtrimstr("%") | try tonumber catch null) as $rem
-      | select($rem != null)
-      | {
-          title: ($group + (if $weekly then " weekly" else " 5h" end)),
-          label: ($group + (if $weekly then " (weekly)" else " (5-hour)" end)),
-          percent: (((100 - $rem) | [., 0] | max) / 100),
-          resetsAt: (.[3] // "")
-        }]
-    | sort_by([(.title | test("^Gemini") | not), (.title | test("weekly"))])') || limits='[]'
-fi
 
-dates=$(for offset in 6 5 4 3 2 1 0; do date -d "-$offset day" +%F; done | jq -Rsc 'split("\n") | map(select(. != ""))')
+def get_cache_dir() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
 
-jq -n \
-  --argjson prompts "$prompts" \
-  --argjson sessions "$sessions" \
-  --argjson steps "$steps" \
-  --argjson dates "$dates" \
-  --argjson limits "$limits" \
-  --arg today "$(date +%F)" '
-  def tokens: map(.input + .output) | add // 0;
-  ([$prompts[], $sessions[].date, ($steps[].date | select(.))] | unique) as $active
-  | {
-      schemaVersion: 1,
-      id: "agy",
-      name: "Antigravity",
-      ready: true,
-      tierLabel: "",
-      usageStatusText: "",
-      authHelpText: "",
-      hasLocalStats: true,
-      hasPromptStats: true,
-      limits: $limits,
-      todayPrompts: ($prompts | map(select(. == $today)) | length),
-      todaySessions: ($sessions | map(select(.date == $today)) | length),
-      todayTotalTokens: ($steps | map(select(.date == $today)) | tokens),
-      todayTokensByModel: ($steps | map(select(.date == $today and .model != "unknown"))
-        | group_by(.model) | map({key: .[0].model, value: tokens}) | from_entries),
-      recentDays: ($dates | map(. as $d | {date: $d, messageCount: ($steps | map(select(.date == $d)) | tokens)})),
-      totalPrompts: ($prompts | length),
-      totalSessions: ($sessions | length),
-      activeDates: $active,
-      activeDays: ($active | length),
-      modelUsage: ($steps | group_by(.model)
-        | map(select(.[0].model != "unknown" or tokens > 0))
-        | map({key: .[0].model, value: {
-            inputTokens: (map([.input - .cached, 0] | max) | add),
-            outputTokens: (map(.output) | add),
-            cacheReadInputTokens: (map(.cached) | add),
-            cacheCreationInputTokens: 0
-          }})
-        | from_entries),
-      updatedAt: (now | todate)
-    }
-'
+
+def date_string(val: dt.date) -> str:
+  return val.strftime("%Y-%m-%d")
+
+
+def local_date_string() -> str:
+  return date_string(dt.datetime.now().date())
+
+
+def recent_date_strings() -> list[str]:
+  today = dt.datetime.now().date()
+  return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+
+
+def empty_bucket() -> dict[str, int]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
+  if max_age_seconds <= 0 or not path.is_file():
+    return None
+  try:
+    if time.time() - path.stat().st_mtime <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+# ---------------------------------------------------------------- local scan
+
+
+def is_valid_date(date_str: str) -> bool:
+  if not date_str or not isinstance(date_str, str):
+    return False
+  return bool(re.match(r"^20\d\d-\d\d-\d\d$", date_str))
+
+
+def scan_local_stats(agy_dir: Path) -> dict[str, Any]:
+  today = local_date_string()
+  recent_dates = recent_date_strings()
+  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+
+  prompts_list: list[str] = []
+  history_file = agy_dir / "history.jsonl"
+  if history_file.is_file():
+    try:
+      with history_file.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+          line = line.strip()
+          if not line:
+            continue
+          try:
+            entry = json.loads(line)
+            ts = entry.get("timestamp")
+            if isinstance(ts, (int, float)) and ts > 0:
+              d = date_string(dt.datetime.fromtimestamp(ts / 1000.0).date())
+              if is_valid_date(d):
+                prompts_list.append(d)
+          except Exception:
+            continue
+    except Exception as exc:
+      print(f"Warning: error reading history.jsonl: {exc}", file=sys.stderr)
+
+  sessions_list: list[str] = []
+  db_file = agy_dir / "conversation_summaries.db"
+  if db_file.is_file():
+    try:
+      conn = sqlite3.connect(f"file:{db_file.resolve().as_posix()}?mode=ro", uri=True, timeout=2.0)
+      try:
+        conn.execute("PRAGMA query_only = ON")
+        cur = conn.cursor()
+        cur.execute(
+          "SELECT date(substr(last_user_input_time, 1, 19), 'localtime') as date "
+          "FROM conversation_summaries WHERE parent_conversation_id = ''"
+        )
+        for row in cur.fetchall():
+          if row and row[0]:
+            d = str(row[0]).strip()
+            if is_valid_date(d):
+              sessions_list.append(d)
+      finally:
+        conn.close()
+    except Exception as exc:
+      print(f"Warning: error reading conversation_summaries.db: {exc}", file=sys.stderr)
+
+  # Scan transcripts: prefer transcript.jsonl, fallback to transcript_full.jsonl
+  transcript_files = list(agy_dir.glob("brain/*/.system_generated/logs/transcript.jsonl"))
+  if not transcript_files:
+    transcript_files = list(agy_dir.glob("brain/*/.system_generated/logs/transcript_full.jsonl"))
+
+  model_re = re.compile(r"`Model Selection` from .*? to (?P<m>.+?)\.\s*(?:No need|If reporting|$)")
+
+  active_dates: set[str] = {d for d in prompts_list if is_valid_date(d)} | {d for d in sessions_list if is_valid_date(d)}
+  today_tokens_by_model: dict[str, int] = {}
+  model_usage: dict[str, dict[str, int]] = {}
+  today_tokens_total = 0
+
+  for tf in transcript_files:
+    current_model = "unknown"
+    try:
+      with tf.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+          line = line.strip()
+          if not line:
+            continue
+          try:
+            entry = json.loads(line)
+          except Exception:
+            continue
+
+          content = entry.get("content")
+          if isinstance(content, str):
+            match = model_re.search(content)
+            if match:
+              current_model = match.group("m").strip()
+
+          created_at = entry.get("created_at")
+          day = None
+          if created_at and isinstance(created_at, str):
+            try:
+              clean_ts = created_at.split(".")[0].replace("Z", "+00:00")
+              parsed_dt = dt.datetime.fromisoformat(clean_ts)
+              if parsed_dt.tzinfo is not None:
+                parsed_dt = parsed_dt.astimezone()
+              parsed_day = date_string(parsed_dt.date())
+              if is_valid_date(parsed_day):
+                day = parsed_day
+            except Exception:
+              pass
+
+          inp = int(entry.get("input_tokens") or entry.get("inputTokens") or entry.get("promptTokenCount") or 0)
+          cached = int(
+            entry.get("cachedContentTokenCount")
+            or entry.get("cache_read_input_tokens")
+            or entry.get("cacheReadInputTokens")
+            or entry.get("cache_read_tokens")
+            or 0
+          )
+          out = int(
+            entry.get("output_tokens")
+            or entry.get("outputTokens")
+            or entry.get("candidatesTokenCount")
+            or entry.get("thoughtsTokenCount")
+            or 0
+          )
+          total_step_tokens = inp + out
+
+          if day:
+            active_dates.add(day)
+            if day in recent:
+              recent[day]["messageCount"] += total_step_tokens
+            if day == today:
+              today_tokens_total += total_step_tokens
+              if current_model != "unknown":
+                today_tokens_by_model[current_model] = (
+                  today_tokens_by_model.get(current_model, 0) + total_step_tokens
+                )
+
+          if current_model != "unknown" or total_step_tokens > 0:
+            bucket = model_usage.setdefault(current_model, empty_bucket())
+            bucket["inputTokens"] += max(0, inp - cached)
+            bucket["outputTokens"] += out
+            bucket["cacheReadInputTokens"] += cached
+    except Exception as exc:
+      print(f"Warning: error reading transcript {tf}: {exc}", file=sys.stderr)
+
+  # Filter out empty "unknown"
+  if "unknown" in model_usage:
+    total_unknown = sum(model_usage["unknown"].values())
+    if total_unknown <= 0:
+      del model_usage["unknown"]
+
+  today_prompts_count = sum(1 for d in prompts_list if d == today)
+  today_sessions_count = sum(1 for d in sessions_list if d == today)
+  sorted_active_dates = sorted(active_dates)
+
+  return {
+    "todayPrompts": today_prompts_count,
+    "todaySessions": today_sessions_count,
+    "todayTotalTokens": today_tokens_total,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [recent[d] for d in recent_dates],
+    "totalPrompts": len(prompts_list),
+    "totalSessions": len(sessions_list),
+    "activeDates": sorted_active_dates,
+    "activeDays": len(sorted_active_dates),
+    "modelUsage": model_usage,
+  }
+
+
+def cached_scan(agy_dir: Path, max_age_seconds: float) -> dict[str, Any]:
+  cache_file = get_cache_dir() / "agy-scan.json"
+  lock_file = get_cache_dir() / "agy-scan.lock"
+
+  cached = read_fresh_json(cache_file, max_age_seconds)
+  if cached is not None:
+    return cached
+
+  with lock_file.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+      cached = read_fresh_json(cache_file, max_age_seconds)
+      if cached is not None:
+        return cached
+      summary = scan_local_stats(agy_dir)
+      write_json_atomic(cache_file, summary)
+      return summary
+    finally:
+      fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+# ------------------------------------------------------------------- limits
+
+
+def normalize_iso_reset_at(raw: str) -> str:
+  raw = str(raw or "").strip()
+  if not raw:
+    return ""
+  try:
+    parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    return parsed.isoformat()
+  except Exception:
+    return raw
+
+
+def probe_limits(timeout_seconds: float = 10.0) -> list[dict[str, Any]]:
+  cache_file = get_cache_dir() / "agy-limits.json"
+
+  # Fast check: run agy -p /usage
+  try:
+    proc = subprocess.run(
+      ["agy", "-p", "/usage", "--print-timeout", f"{int(timeout_seconds)}s"],
+      capture_output=True,
+      text=True,
+      timeout=timeout_seconds + 3.0,
+    )
+    if proc.returncode == 0 and proc.stdout.strip():
+      limits: list[dict[str, Any]] = []
+      for line in proc.stdout.strip().split("\n"):
+        parts = line.split("\t")
+        if len(parts) < 3:
+          continue
+        group_raw = parts[0].strip()
+        window_raw = parts[1].strip()
+        pct_raw = parts[2].strip()
+        resets_at_raw = parts[3].strip() if len(parts) > 3 else ""
+
+        if re.search(r"gemini", group_raw, re.IGNORECASE):
+          group = "Gemini"
+        elif re.search(r"claude|gpt", group_raw, re.IGNORECASE):
+          group = "Claude/GPT"
+        else:
+          group = re.sub(r"\s+[Mm]odels$", "", group_raw, flags=re.IGNORECASE)
+
+        is_weekly = bool(re.search(r"week", window_raw, re.IGNORECASE))
+
+        rem_str = pct_raw.rstrip("%").strip()
+        try:
+          rem = float(rem_str)
+        except ValueError:
+          continue
+
+        percent = round(max(0.0, (100.0 - rem)) / 100.0, 4)
+        title = group + (" weekly" if is_weekly else " 5h")
+        label = group + (" (weekly)" if is_weekly else " (5-hour)")
+        resets_at = normalize_iso_reset_at(resets_at_raw)
+
+        limits.append({
+          "title": title,
+          "label": label,
+          "percent": percent,
+          "resetsAt": resets_at,
+        })
+
+      limits.sort(key=lambda x: (not x["title"].startswith("Gemini"), "weekly" in x["title"]))
+      if limits:
+        write_json_atomic(cache_file, {"limits": limits, "updatedAt": time.time()})
+        return limits
+  except Exception as exc:
+    print(f"Warning: error probing agy limits: {exc}", file=sys.stderr)
+
+  # Fallback to cached limits if probe failed
+  cached = read_fresh_json(cache_file, 86400)
+  if cached and isinstance(cached.get("limits"), list):
+    return cached["limits"]
+
+  return []
+
+
+# --------------------------------------------------------------------- main
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser(description="Antigravity usage collector")
+  parser.add_argument("--force", action="store_true", help="Force refresh local cache")
+  parser.add_argument("--limits-only", action="store_true", help="Reuse local scan if recent")
+  parser.add_argument("--write", action="store_true", help="Write directly to usage directory")
+  args = parser.parse_args()
+
+  agy_dir = get_agy_dir()
+  if not agy_dir.is_dir():
+    sys.exit(0)
+
+  max_age = 0.0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
+  stats = cached_scan(agy_dir, max_age)
+  limits = probe_limits(10.0)
+
+  payload = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "ready": True,
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": AUTH_HELP,
+    "hasLocalStats": True,
+    "hasPromptStats": True,
+    "limits": limits,
+    **stats,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+  }
+
+  if args.write:
+    usage_file = get_usage_dir() / f"{AGENT_ID}.json"
+    write_json_atomic(usage_file, payload)
+
+  print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+if __name__ == "__main__":
+  main()
