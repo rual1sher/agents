@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "rualisher.sysmon",
+  "name": "System Monitor",
+  "version": "1.0.0",
+  "author": "rualisher",
+  "description": "System monitor showing CPU, temperature, RAM and processes",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "System Monitor",
+    "description": "System monitor showing CPU, temperature, RAM and processes",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
